@@ -7,6 +7,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routers.events import router as events_router
 from app.routers.surveillance import router as surveillance_router
 from app.routers.history import router as history_router
+from app.routers.employees import router as employees_router
+from app.routers.products import router as products_router
+from app.routers.userstories import router as userstories_router
+from app.routers.conversations import router as conversations_router
+from app.routers.agent import router as agent_router
+from app.routers.leads import router as leads_router
 from app.manager import manager
 from app.db.database import init_db
 
@@ -24,7 +30,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Nova AEI — Nova Video Event Detection",
     description="Real-time webcam video recording, S3 upload, Amazon Nova analysis, and SQLite persistence",
-    version="0.4.0",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
@@ -37,15 +43,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Static files ──────────────────────────────────────────────────────
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ── Routers ───────────────────────────────────────────────────────────
 app.include_router(events_router)
 app.include_router(surveillance_router)
 app.include_router(history_router)
-
-
+app.include_router(employees_router)
+app.include_router(products_router)
+app.include_router(userstories_router)
+app.include_router(conversations_router)
+app.include_router(agent_router)
+app.include_router(leads_router)
 # ── Core endpoints ────────────────────────────────────────────────────
 
 @app.get("/")

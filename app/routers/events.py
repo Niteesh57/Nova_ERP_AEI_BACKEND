@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from app.core.models import Event
 from app.manager import manager
 from app.db.database import get_db
-from app.models import db_models
+from app import models as db_models
 
 router = APIRouter(prefix="/events", tags=["Events"])
 

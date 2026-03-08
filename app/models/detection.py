@@ -11,4 +11,8 @@ class DetectionResult(Base):
     results_json = Column(Text, nullable=False)   # {"event_name": true/false}
     summary = Column(Text, nullable=True)
     s3_uri = Column(String, nullable=True)
+    identified_name = Column(String, nullable=True)   # e.g. "John Doe" or "Unknown Person"
+    identified_email = Column(String, nullable=True)  # e.g. "john@acme.com" or null
+    identified_persons_json = Column(Text, nullable=True) # e.g. '[{"name": "...", "email": "..."}]'
     created_at = Column(DateTime, default=datetime.utcnow)
+

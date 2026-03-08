@@ -1,3 +1,4 @@
+import io
 import boto3
 import logging
 from app.core.config import AWS_REGION, AWS_S3_BUCKET
@@ -32,4 +33,33 @@ def upload_video(file_path: str, object_name: str) -> str:
     except Exception as e:
         print(f"[S3] ❌ Upload failed: {e}")
         logger.error(f"[S3] Upload failed: {e}", exc_info=True)
+        return ""
+
+
+def upload_photo_to_s3(image_bytes: bytes, object_name: str) -> str:
+    """
+    Uploads raw image bytes to S3 under the 'employees/' prefix.
+    Returns the public HTTPS URL on success, or '' on failure.
+    """
+    if not AWS_S3_BUCKET:
+        logger.error("[S3] AWS_S3_BUCKET is not set — cannot upload photo.")
+        return ""
+
+    key = f"employees/{object_name}"
+    print(f"[S3] Uploading photo → s3://{AWS_S3_BUCKET}/{key}")
+
+    try:
+        client = _get_client()
+        client.upload_fileobj(
+            io.BytesIO(image_bytes),
+            AWS_S3_BUCKET,
+            key,
+            ExtraArgs={"ContentType": "image/jpeg"},
+        )
+        url = f"https://{AWS_S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{key}"
+        print(f"[S3] ✅ Photo upload successful: {url}")
+        return url
+    except Exception as e:
+        print(f"[S3] ❌ Photo upload failed: {e}")
+        logger.error(f"[S3] Photo upload failed: {e}", exc_info=True)
         return ""

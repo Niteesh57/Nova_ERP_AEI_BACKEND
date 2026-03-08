@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from datetime import datetime
 
 
@@ -25,3 +25,30 @@ class SurveillanceStatus(BaseModel):
     active_events: int
     capture_interval: int
     last_capture: Optional[str] = None
+
+
+# --- Conversation Models ---
+
+class ConversationMessageSchema(BaseModel):
+    id: int
+    session_id: str
+    user_query: str
+    agent_response: str
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+class ConversationSessionSchema(BaseModel):
+    session_id: str
+    session_name: Optional[str] = None
+    created_at: datetime
+    messages: List[ConversationMessageSchema] = []
+    
+    class Config:
+        from_attributes = True
+
+class ChatLogRequest(BaseModel):
+    session_id: str
+    user_query: str
+    agent_response: str

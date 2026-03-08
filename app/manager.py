@@ -10,6 +10,8 @@ from app.core.config import CAPTURE_INTERVAL_SECONDS
 from app.core.models import Event
 from app.services.s3_service import upload_video
 from app.services.bedrock_service import analyze_video
+from app.services.face_service import extract_faces_from_video
+from app.services.chromadb_service import identify_face
 
 logger = logging.getLogger(__name__)
 
@@ -22,16 +24,23 @@ def _save_detection_to_db(payload: dict):
         from app.db.database import SessionLocal
         from app.models.detection import DetectionResult
         db = SessionLocal()
+        persons = payload.get("identified_persons") or []
+        first_person = persons[0] if persons else {}
         row = DetectionResult(
             timestamp=payload.get("timestamp", ""),
             results_json=json.dumps(payload.get("results", {})),
             summary=payload.get("summary", ""),
             s3_uri=payload.get("s3_uri", ""),
+            identified_name=first_person.get("name"),
+            identified_email=first_person.get("email"),
+            identified_persons_json=json.dumps(persons) if persons else None,
         )
         db.add(row)
         db.commit()
+        db.refresh(row)
+        row_id = row.id
         db.close()
-        print(f"[DB] ✅ DetectionResult saved (id={row.id})")
+        print(f"[DB] ✅ DetectionResult saved (id={row_id})")
     except Exception as e:
         print(f"[DB] ❌ Failed to save DetectionResult: {e}")
         logger.error(f"[DB] Failed to save DetectionResult: {e}", exc_info=True)
@@ -148,12 +157,38 @@ class SurveillanceManager:
                 result = await loop.run_in_executor(None, analyze_video, s3_uri, active_events)
                 print(f"[Manager] Nova result: {result}")
 
+                # ── Face Identification ──────────────────────────────────
+                identified_persons = []
+                event_results = result.get("results", {})
+                
+                # Check if ANY event returned > 0 rather than just boolean
+                any_event_triggered = any(v for v in event_results.values() if v)
+
+                if any_event_triggered:
+                    print("[Manager] Event(s) triggered — attempting face identification...")
+                    faces_bytes = await loop.run_in_executor(
+                        None, extract_faces_from_video, local_video_path
+                    )
+                    
+                    if faces_bytes:
+                        for face in faces_bytes:
+                            match = await loop.run_in_executor(None, identify_face, face)
+                            if match:
+                                identified_persons.append(match)
+                                print(f"[Manager] 🙋 Identified person: {match['name']} ({match.get('email')})")
+                            else:
+                                identified_persons.append({"name": "Unknown Person", "email": None})
+                                print("[Manager] 👤 Unknown person — no ChromaDB match")
+                    else:
+                        print("[Manager] 👤 No faces extracted from video")
+
                 payload = {
                     "type": "event_result",
                     "timestamp": self.last_capture,
-                    "results": result.get("results", {}),
+                    "results": event_results,
                     "summary": result.get("summary", ""),
                     "s3_uri": s3_uri,
+                    "identified_persons": identified_persons,
                 }
 
                 # Save to JSON log

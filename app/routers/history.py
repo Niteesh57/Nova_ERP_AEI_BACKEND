@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 from typing import List
 from app.db.database import get_db
-from app.models import db_models
+from app import models as db_models
 
 router = APIRouter(prefix="/history", tags=["History"])
 
@@ -34,8 +34,13 @@ async def get_history(
                 "results": json.loads(r.results_json),
                 "summary": r.summary,
                 "s3_uri": r.s3_uri,
-                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "identified_persons": (
+                    json.loads(r.identified_persons_json) if getattr(r, 'identified_persons_json', None)
+                    else ([{"name": r.identified_name, "email": r.identified_email}] if getattr(r, 'identified_name', None) else None)
+                ),
+                "created_at": r.created_at.isoformat() if getattr(r, 'created_at', None) else None,
             }
             for r in rows
         ],
     }
+

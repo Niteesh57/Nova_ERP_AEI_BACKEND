@@ -4,3 +4,9 @@ boto3
 python-dotenv
 python-multipart
 sqlalchemy
+chromadb
+pillow
+aws_sdk_bedrock_runtime
+smithy_aws_core
+langgraph
+nova-act

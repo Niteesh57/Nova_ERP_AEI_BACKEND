@@ -48,7 +48,7 @@ def analyze_video(s3_uri: str, events: List[Event]) -> Dict:
         return {}
 
     if not s3_uri:
-        return {"results": {e.name: False for e in events}, "summary": "No S3 URI provided."}
+        return {"results": {e.name: 0 for e in events}, "summary": "No S3 URI provided."}
 
     event_descriptions = "\n".join(
         f'- "{evt.name}": {evt.description}' for evt in events
@@ -56,11 +56,12 @@ def analyze_video(s3_uri: str, events: List[Event]) -> Dict:
 
     prompt = (
         "You are a surveillance analysis system. Analyze the provided video "
-        "and determine whether each of the following events occurred during the video.\n\n"
+        "and determine HOW MANY people are performing each of the following events. "
+        "If the event did not occur, or 0 people are performing it, return 0.\n\n"
         f"Events to evaluate:\n{event_descriptions}\n\n"
         "Your ENTIRE response must be a single raw JSON object with NO markdown, NO code fences, "
-        "NO extra text before or after. Use this exact structure:\n"
-        '{"results": {"event_name": true}, "summary": "One sentence."}'
+        "NO extra text before or after. Use this exact structure where the value is an integer count:\n"
+        '{"results": {"event_name": 1}, "summary": "One sentence summary."}'
     )
 
     try:
@@ -96,7 +97,7 @@ def analyze_video(s3_uri: str, events: List[Event]) -> Dict:
         # Ensure all events are represented
         for evt in events:
             if evt.name not in results:
-                results[evt.name] = False
+                results[evt.name] = 0
 
         print(f"[Bedrock] ✅ Parsed results: {results}")
         return {"results": results, "summary": summary}
@@ -105,13 +106,50 @@ def analyze_video(s3_uri: str, events: List[Event]) -> Dict:
         print(f"[Bedrock] ❌ Could not parse JSON: {e}")
         logger.error(f"[Bedrock] JSON parse error: {e}")
         return {
-            "results": {evt.name: False for evt in events},
+            "results": {evt.name: 0 for evt in events},
             "summary": f"Could not parse model response as JSON: {str(e)}",
         }
     except Exception as e:
         print(f"[Bedrock] ❌ API error: {e}")
         logger.error(f"[Bedrock] API error: {e}", exc_info=True)
         return {
-            "results": {evt.name: False for evt in events},
             "summary": f"API Error: {str(e)}",
         }
+
+def chat_with_agent(user_query: str, session_history: List[Dict[str, str]] = None) -> str:
+    """
+    Conversational endpoint using Amazon Nova via Bedrock.
+    """
+    try:
+        client = _get_client()
+        
+        system_prompt = (
+            "You are Nova Sonnet, a highly capable AI assistant integrated into a video surveillance and ERP application. "
+            "Your job is to assist the user by answering their queries thoughtfully and accurately. "
+            "Keep your responses relatively concise but helpful, as this may be spoken via Text-to-Speech."
+        )
+
+        # Basic integration of past messages into prompt
+        messages = []
+        if session_history:
+            for msg in session_history:
+                # Add past conversational blocks if full integration is needed later. Currently sticking to simple chat.
+                pass
+                
+        messages.append({
+            "role": "user",
+            "content": [{"text": user_query}]
+        })
+        
+        response = client.converse(
+            modelId=BEDROCK_MODEL_ID,
+            system=[{"text": system_prompt}],
+            messages=messages,
+        )
+        
+        reply_text = response["output"]["message"]["content"][0]["text"]
+        return reply_text
+    except Exception as e:
+        logger.error(f"[Bedrock Agent] Failed to query LLM: {e}")
+        raise e
+
