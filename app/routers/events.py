@@ -1,3 +1,4 @@
+import json
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
 
@@ -17,7 +18,13 @@ async def add_event(event: Event, db: Session = Depends(get_db)):
         raise HTTPException(status_code=409, detail=f"Event '{event.name}' already exists")
 
     # Save to DB
-    db_trigger = db_models.EventTrigger(name=event.name, description=event.description)
+    employees_json = json.dumps(event.authorized_employees) if event.authorized_employees else None
+    
+    db_trigger = db_models.EventTrigger(
+        name=event.name, 
+        description=event.description,
+        authorized_employees=employees_json
+    )
     db.add(db_trigger)
     db.commit()
     print(f"[DB] Saved event trigger: {event.name}")
@@ -35,7 +42,11 @@ async def list_events():
 async def list_saved_events(db: Session = Depends(get_db)):
     """Return all event triggers persisted in the DB."""
     triggers = db.query(db_models.EventTrigger).all()
-    return [Event(name=t.name, description=t.description) for t in triggers]
+    events = []
+    for t in triggers:
+        auth_emps = json.loads(t.authorized_employees) if t.authorized_employees else None
+        events.append(Event(name=t.name, description=t.description, authorized_employees=auth_emps))
+    return events
 
 
 @router.delete("/{name}")

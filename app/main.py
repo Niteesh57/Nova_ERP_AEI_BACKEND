@@ -13,6 +13,9 @@ from app.routers.userstories import router as userstories_router
 from app.routers.conversations import router as conversations_router
 from app.routers.agent import router as agent_router
 from app.routers.leads import router as leads_router
+from app.routers.market import router as market_router
+from app.routers.tickets import router as tickets_router
+from app.routers.functions import router as functions_router
 from app.manager import manager
 from app.db.database import init_db
 
@@ -37,7 +40,7 @@ app = FastAPI(
 # ── CORS Middleware ───────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000", "http://127.0.0.1:8000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -54,6 +57,9 @@ app.include_router(userstories_router)
 app.include_router(conversations_router)
 app.include_router(agent_router)
 app.include_router(leads_router)
+app.include_router(market_router)
+app.include_router(tickets_router)
+app.include_router(functions_router)
 # ── Core endpoints ────────────────────────────────────────────────────
 
 @app.get("/")

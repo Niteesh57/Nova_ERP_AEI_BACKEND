@@ -35,7 +35,7 @@ def init_db():
     # ── Migrate existing DBs: add new columns if they don't exist ─────
     _run_migrations()
 
-    print(f"[DB] ✅ Tables verified/created at {DB_PATH}")
+    print(f"[DB] SUCCESS Tables verified/created at {DB_PATH}")
 
 
 def _run_migrations():
@@ -45,6 +45,10 @@ def _run_migrations():
         "ALTER TABLE detection_results ADD COLUMN identified_email VARCHAR",
         "ALTER TABLE detection_results ADD COLUMN identified_persons_json TEXT",
         "ALTER TABLE conversation_sessions ADD COLUMN session_name VARCHAR",
+        "ALTER TABLE event_triggers ADD COLUMN authorized_employees TEXT",
+        "ALTER TABLE market_results ADD COLUMN data TEXT",
+        "ALTER TABLE tickets ADD COLUMN is_vectorized BOOLEAN DEFAULT 0",
+        "ALTER TABLE tickets ADD COLUMN resolution TEXT",
     ]
     with engine.connect() as conn:
         for stmt in migrations:
@@ -52,7 +56,7 @@ def _run_migrations():
                 conn.execute(text(stmt))
                 conn.commit()
                 col = stmt.split("ADD COLUMN ")[1].split(" ")[0]
-                print(f"[DB] ✅ Migration applied: added column '{col}'")
+                print(f"[DB] SUCCESS Migration applied: added column '{col}'")
             except Exception:
                 # Column already exists — this is normal on subsequent startups
                 pass
@@ -87,8 +91,8 @@ def _backfill_session_names(conn):
                 {"name": f"NOVA ERP ({i})", "sid": sid}
             )
         conn.commit()
-        print(f"[DB] ✅ Backfilled session_name for {len(rows)} session(s)")
+        print(f"[DB] SUCCESS Backfilled session_name for {len(rows)} session(s)")
     except Exception as e:
-        print(f"[DB] ⚠️ session_name backfill error: {e}")
+        print(f"[DB] WARNING session_name backfill error: {e}")
 
 

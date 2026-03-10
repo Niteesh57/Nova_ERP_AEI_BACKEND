@@ -4,8 +4,9 @@ from datetime import datetime
 
 
 class Event(BaseModel):
-    name: str = Field(..., description="Unique event identifier, e.g. 'person_opening_door'")
-    description: str = Field(..., description="What to look for, e.g. 'A person is opening the door'")
+    name: str = Field(..., description="Unique snake_case identifier (e.g., person_opening_door)")
+    description: str = Field(..., description="Human readable description")
+    authorized_employees: Optional[List[str]] = Field(default=None, description="List of employee names authorized for this event. Intrusion alerts trigger if others perform it.")
 
 
 class EventResult(BaseModel):

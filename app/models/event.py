@@ -9,4 +9,5 @@ class EventTrigger(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True, nullable=False, index=True)
     description = Column(Text, nullable=False)
+    authorized_employees = Column(Text, nullable=True) # Stored as JSON string list
     created_at = Column(DateTime, default=datetime.utcnow)

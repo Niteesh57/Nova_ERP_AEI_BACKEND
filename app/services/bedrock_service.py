@@ -64,6 +64,10 @@ def analyze_video(s3_uri: str, events: List[Event]) -> Dict:
         '{"results": {"event_name": 1}, "summary": "One sentence summary."}'
     )
 
+    video_format = s3_uri.split('.')[-1].lower() if '.' in s3_uri else 'mp4'
+    if video_format not in ['mp4', 'mkv', 'webm', 'mov']:
+        video_format = 'mp4'
+
     try:
         client = _get_client()
         response = client.converse(
@@ -74,7 +78,7 @@ def analyze_video(s3_uri: str, events: List[Event]) -> Dict:
                     "content": [
                         {
                             "video": {
-                                "format": "webm",
+                                "format": video_format,
                                 "source": {
                                     "s3Location": {"uri": s3_uri}
                                 },

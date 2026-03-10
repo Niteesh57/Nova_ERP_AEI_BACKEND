@@ -1,4 +1,5 @@
 import asyncio
+import cv2
 import json
 import os
 import logging
@@ -16,6 +17,35 @@ from app.services.chromadb_service import identify_face
 logger = logging.getLogger(__name__)
 
 EVENTS_LOG_FILE = "events_log.json"
+
+def _convert_webm_to_mp4(in_file: str, out_file: str) -> bool:
+    try:
+        cap = cv2.VideoCapture(in_file)
+        if not cap.isOpened():
+            return False
+        
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps != fps: # NaN check just in case
+            fps = 15.0
+            
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(out_file, fourcc, fps, (w, h))
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            out.write(frame)
+            
+        cap.release()
+        out.release()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to transcode {in_file} to mp4: {e}")
+        return False
 
 
 def _save_detection_to_db(payload: dict):
@@ -80,7 +110,8 @@ class SurveillanceManager:
             triggers = db.query(EventTrigger).all()
             db.close()
             for t in triggers:
-                evt = Event(name=t.name, description=t.description)
+                auth_emps = json.loads(t.authorized_employees) if t.authorized_employees else None
+                evt = Event(name=t.name, description=t.description, authorized_employees=auth_emps)
                 if not any(e.name == evt.name for e in self.events):
                     self.events.append(evt)
             print(f"[DB] Loaded {len(triggers)} event trigger(s) from DB")
@@ -130,6 +161,7 @@ class SurveillanceManager:
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         extension = file.filename.split('.')[-1] if file.filename and '.' in file.filename else 'webm'
         local_video_path = f"tmp/chunk_{timestamp_str}.{extension}"
+        local_upload_path = local_video_path
         s3_object_name = f"nova_surveillance/chunk_{timestamp_str}.{extension}"
 
         print(f"[Manager] Received upload: {file.filename}, saving to {local_video_path}")
@@ -140,12 +172,25 @@ class SurveillanceManager:
             with open(local_video_path, "wb") as f:
                 f.write(content)
 
+            # Transcode fragmented webm to compliant mp4 so Bedrock doesn't throw ValidationException
+            local_mp4_path = local_video_path.replace(f'.{extension}', '.mp4')
+            if extension.lower() in ['webm', 'mkv', 'ogg']:
+                print(f"[Manager] Transcoding fragmented {extension} to compliant mp4...")
+                loop = asyncio.get_event_loop()
+                success = await loop.run_in_executor(None, _convert_webm_to_mp4, local_video_path, local_mp4_path)
+                if success:
+                    local_upload_path = local_mp4_path
+                    s3_object_name = s3_object_name.replace(f'.{extension}', '.mp4')
+                    print(f"[Manager] Transcode successful: {local_mp4_path}")
+                else:
+                    print(f"[Manager] Transcode failed, falling back to {local_video_path}")
+
             active_events = list(self.events)
             print(f"[Manager] Active events: {[e.name for e in active_events]}")
 
             if active_events:
                 loop = asyncio.get_event_loop()
-                s3_uri = await loop.run_in_executor(None, upload_video, local_video_path, s3_object_name)
+                s3_uri = await loop.run_in_executor(None, upload_video, local_upload_path, s3_object_name)
 
                 if not s3_uri:
                     error_msg = {"error": "Failed to upload video to S3."}
@@ -182,6 +227,25 @@ class SurveillanceManager:
                     else:
                         print("[Manager] 👤 No faces extracted from video")
 
+                # ── Intrusion Alert Logic ────────────────────────────────
+                alerts = []
+                for event_name, is_detected in event_results.items():
+                    val = is_detected > 0 if isinstance(is_detected, int) else bool(is_detected)
+                    if val:
+                        evt = next((e for e in active_events if e.name == event_name), None)
+                        if evt and evt.authorized_employees:
+                            # If there are NO faces, it's an unknown intrusion by default
+                            if not identified_persons:
+                                alert_msg = f"Intrusion Alert: '{event_name}' triggered by unknown/unseen person."
+                                print(f"[ALERT] {alert_msg} -> (Mock) Sending Email to Admin...")
+                                alerts.append(alert_msg)
+                            else:
+                                for person in identified_persons:
+                                    if person["name"] not in evt.authorized_employees:
+                                        alert_msg = f"Intrusion Alert: '{event_name}' triggered by unauthorized person: {person['name']}"
+                                        print(f"[ALERT] {alert_msg} -> (Mock) Sending Email to Admin...")
+                                        alerts.append(alert_msg)
+
                 payload = {
                     "type": "event_result",
                     "timestamp": self.last_capture,
@@ -189,6 +253,7 @@ class SurveillanceManager:
                     "summary": result.get("summary", ""),
                     "s3_uri": s3_uri,
                     "identified_persons": identified_persons,
+                    "alerts": alerts,
                 }
 
                 # Save to JSON log
@@ -217,11 +282,12 @@ class SurveillanceManager:
             await self.broadcast(error_payload)
             return error_payload
         finally:
-            if os.path.exists(local_video_path):
-                try:
-                    os.remove(local_video_path)
-                except Exception as e:
-                    logger.error(f"Failed to cleanup {local_video_path}: {e}")
+            for path in [local_video_path, local_video_path.replace(f'.{extension}', '.mp4')]:
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except Exception as e:
+                        logger.error(f"Failed to cleanup {path}: {e}")
 
     def _append_to_log(self, data: dict):
         try:

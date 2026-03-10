@@ -10,3 +10,5 @@ aws_sdk_bedrock_runtime
 smithy_aws_core
 langgraph
 nova-act
+tavily-python
+beautifulsoup4
