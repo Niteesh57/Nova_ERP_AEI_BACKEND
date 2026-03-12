@@ -41,7 +41,7 @@ if convert_webm_to_mp4("test.webm", "test.mp4"):
     s3_uri = "s3://video-analyzer-nova/nova_surveillance/test.mp4"
     try:
         response = client.converse(
-            modelId="us.amazon.nova-lite-v1:0",
+            modelId="us.amazon.nova-2-lite-v1:0",
             messages=[
                 {
                     "role": "user",
