@@ -88,14 +88,16 @@ class SurveillanceManager:
     # ── Event Management ──────────────────────────────────────────────
 
     def add_event(self, event: Event) -> bool:
+        event.name = event.name.strip()
         if any(e.name == event.name for e in self.events):
             return False
         self.events.append(event)
         return True
 
     def remove_event(self, name: str) -> bool:
+        name = name.strip()
         before = len(self.events)
-        self.events = [e for e in self.events if e.name != name]
+        self.events = [e for e in self.events if e.name.strip() != name]
         return len(self.events) < before
 
     def list_events(self) -> List[Event]:

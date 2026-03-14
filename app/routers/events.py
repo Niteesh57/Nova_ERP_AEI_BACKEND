@@ -13,11 +13,9 @@ router = APIRouter(prefix="/events", tags=["Events"])
 @router.post("/", response_model=Event)
 async def add_event(event: Event, db: Session = Depends(get_db)):
     """Add a new event trigger and persist it to DB."""
-    success = manager.add_event(event)
-    if not success:
-        raise HTTPException(status_code=409, detail=f"Event '{event.name}' already exists")
-
-    # Save to DB
+    event.name = event.name.strip()
+    
+    # Save to DB first
     employees_json = json.dumps(event.authorized_employees) if event.authorized_employees else None
     
     db_trigger = db_models.EventTrigger(
@@ -26,9 +24,21 @@ async def add_event(event: Event, db: Session = Depends(get_db)):
         authorized_employees=employees_json
     )
     db.add(db_trigger)
-    db.commit()
-    print(f"[DB] Saved event trigger: {event.name}")
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        if "UNIQUE constraint failed" in str(e):
+             raise HTTPException(status_code=409, detail=f"Event '{event.name}' already exists in DB")
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
 
+    # Then update in-memory manager
+    success = manager.add_event(event)
+    if not success:
+        # This shouldn't happen if DB check passed, but just in case
+        print(f"[Warning] Event '{event.name}' already existed in manager but not in DB.")
+
+    print(f"[DB] Saved and activated event trigger: {event.name}")
     return event
 
 
@@ -52,13 +62,18 @@ async def list_saved_events(db: Session = Depends(get_db)):
 @router.delete("/{name}")
 async def delete_event(name: str, db: Session = Depends(get_db)):
     """Remove an event trigger from memory and DB."""
-    success = manager.remove_event(name)
-    if not success:
-        raise HTTPException(status_code=404, detail=f"Event '{name}' not found")
-
+    name = name.strip()
+    
+    # Remove from DB
     db.query(db_models.EventTrigger).filter(db_models.EventTrigger.name == name).delete()
     db.commit()
     print(f"[DB] Deleted event trigger: {name}")
+
+    # Remove from memory
+    success = manager.remove_event(name)
+    if not success:
+        # If it was in DB but not manager, we still consider it success for delete
+        print(f"[Manager] Event '{name}' not found in memory during deletion.")
 
     return {"detail": f"Event '{name}' removed"}
 

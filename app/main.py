@@ -35,6 +35,8 @@ app = FastAPI(
     description="Real-time webcam video recording, S3 upload, Amazon Nova analysis, and SQLite persistence",
     version="0.5.0",
     lifespan=lifespan,
+    docs_url="/api/docs",
+    openapi_url="/api/openapi.json"
 )
 
 # ── CORS Middleware ───────────────────────────────────────────────────
@@ -48,33 +50,33 @@ app.add_middleware(
 
 
 # ── Routers ───────────────────────────────────────────────────────────
-app.include_router(events_router)
-app.include_router(surveillance_router)
-app.include_router(history_router)
-app.include_router(employees_router)
-app.include_router(products_router)
-app.include_router(userstories_router)
-app.include_router(conversations_router)
-app.include_router(agent_router)
-app.include_router(leads_router)
-app.include_router(market_router)
-app.include_router(tickets_router)
-app.include_router(functions_router)
+app.include_router(events_router, prefix="/api")
+app.include_router(surveillance_router, prefix="/api")
+app.include_router(history_router, prefix="/api")
+app.include_router(employees_router, prefix="/api")
+app.include_router(products_router, prefix="/api")
+app.include_router(userstories_router, prefix="/api")
+app.include_router(conversations_router, prefix="/api")
+app.include_router(agent_router, prefix="/api")
+app.include_router(leads_router, prefix="/api")
+app.include_router(market_router, prefix="/api")
+app.include_router(tickets_router, prefix="/api")
+app.include_router(functions_router, prefix="/api")
 # ── Core endpoints ────────────────────────────────────────────────────
 
-@app.get("/")
+@app.get("/api")
 async def root():
-    return FileResponse("static/index.html")
+    return {"message": "Nova AEI Backend API is running. Visit /api/docs for documentation."}
 
 
-@app.get("/health")
+@app.get("/api/health")
 async def health_check():
     return {"status": "healthy"}
 
 
 # ── WebSocket ────────────────────────────────────────────────────────
 
-@app.websocket("/ws")
+@app.websocket("/api/ws")
 async def websocket_endpoint(ws: WebSocket):
     await manager.register(ws)
     try:

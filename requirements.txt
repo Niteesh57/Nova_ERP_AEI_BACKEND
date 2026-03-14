@@ -12,3 +12,4 @@ langgraph
 nova-act
 tavily-python
 beautifulsoup4
+opencv-python-headless

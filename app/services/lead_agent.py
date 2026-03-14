@@ -25,7 +25,7 @@ def _nova_lite(prompt: str) -> str:
         "messages": [{"role": "user", "content": [{"text": prompt}]}],
         "inferenceConfig": {"maxTokens": 1024, "temperature": 0.1}
     })
-    resp = client.invoke_model(modelId="amazon.nova-2-lite-v1:0", body=body)
+    resp = client.invoke_model(modelId="global.amazon.nova-2-lite-v1:0", body=body)
     result = json.loads(resp["body"].read())
     return result["output"]["message"]["content"][0]["text"].strip()
 

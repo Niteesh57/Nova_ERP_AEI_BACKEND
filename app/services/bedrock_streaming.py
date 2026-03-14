@@ -2,7 +2,6 @@ import asyncio
 import base64
 import json
 import uuid
-import pytz
 import datetime
 import re
 import boto3
@@ -24,10 +23,11 @@ def debug_print(message):
     if DEBUG:
         print(f"[{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] BEDROCK: {message}")
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def query_knowledge_base(query_text: str) -> str:
-    """Query the AWS Knowledge Base using retrieve() (Hybrid Approach 3)."""
+# ── Tool Implementations ───────────────────────────────────────────────────────
+
+def _query_knowledge_base(query_text: str) -> str:
+    """Query the AWS Knowledge Base using retrieve()."""
     kb_id = "FB5BW6TSAA"
     try:
         client = boto3.client("bedrock-agent-runtime", region_name=AWS_REGION)
@@ -38,7 +38,7 @@ def query_knowledge_base(query_text: str) -> str:
         )
         results = response.get("retrievalResults", [])
         if not results:
-            return ""
+            return "No relevant information found in the knowledge base."
         passages = []
         for idx, r in enumerate(results):
             content = r.get("content", {}).get("text", "")
@@ -47,11 +47,11 @@ def query_knowledge_base(query_text: str) -> str:
         return "\n".join(passages)
     except Exception as e:
         debug_print(f"KB Search Error: {e}")
-        return ""
+        return f"Knowledge base search failed: {str(e)}"
 
 
-def raise_ticket_in_db(product_name: str, issue_description: str, username: str) -> str:
-    """Create a support ticket in the database."""
+def _raise_ticket_in_db(product_name: str, issue_description: str, username: str) -> str:
+    """Create a support ticket in the database and return the ticket ID."""
     db: DBSession = SessionLocal()
     try:
         ticket = Ticket(
@@ -63,13 +63,40 @@ def raise_ticket_in_db(product_name: str, issue_description: str, username: str)
         db.commit()
         db.refresh(ticket)
         debug_print(f"Ticket successfully created: ID {ticket.id}")
-        return f"Ticket #{ticket.id}"
+        return f"Ticket #{ticket.id} successfully created."
     except Exception as e:
         db.rollback()
         debug_print(f"Raise Ticket DB Error: {e}")
-        return f"Error: {e}"
+        return f"Failed to create ticket: {str(e)}"
     finally:
         db.close()
+
+
+# ── Tool Processor ─────────────────────────────────────────────────────────────
+
+class ToolProcessor:
+    """Handles async execution of tool calls without blocking the audio stream."""
+
+    async def process_tool_async(self, tool_name: str, tool_input: dict) -> dict:
+        tool = tool_name.lower()
+        debug_print(f"Processing tool: {tool_name} with input: {tool_input}")
+
+        if tool == "searchknowledgebasetool":
+            query = tool_input.get("query", "")
+            loop = asyncio.get_event_loop()
+            result_text = await loop.run_in_executor(None, _query_knowledge_base, query)
+            return {"result": result_text}
+
+        elif tool == "raisetickettool":
+            product  = tool_input.get("product_name", "Unknown Product")
+            issue    = tool_input.get("issue_description", "No description provided")
+            username = tool_input.get("username", "Anonymous")
+            loop = asyncio.get_event_loop()
+            result_text = await loop.run_in_executor(None, _raise_ticket_in_db, product, issue, username)
+            return {"result": result_text}
+
+        else:
+            return {"error": f"Unknown tool: {tool_name}"}
 
 
 # ── Bedrock Manager ───────────────────────────────────────────────────────────
@@ -77,7 +104,8 @@ def raise_ticket_in_db(product_name: str, issue_description: str, username: str)
 class BedrockWebsocketManager:
     """
     Manages bidirectional streaming with AWS Bedrock Nova 2 Sonic.
-    KB and Ticket integration uses the Hybrid Approach (no tool-use in promptStart).
+    Uses native tool-use for KB search and ticket creation.
+    Includes a decoupled audio sender loop for stutter-free playback.
     """
 
     _START_SESSION = json.dumps({
@@ -101,7 +129,7 @@ class BedrockWebsocketManager:
         self.region     = region
         self.available_products = []
 
-        self.response_task   = None
+        self.response_task: asyncio.Task | None = None
         self.stream_response = None
         self.is_active       = False
         self.bedrock_client  = None
@@ -110,15 +138,24 @@ class BedrockWebsocketManager:
         self.sys_content_name   = str(uuid.uuid4())
         self.audio_content_name = str(uuid.uuid4())
 
-        self._user_text_buf:  list = []
-        self._agent_text_buf: list = []
+        # Transcript buffering for DB logging
+        self._user_text_buf:  list[str] = []
+        self._agent_text_buf: list[str] = []
         self._current_role:   str | None = None
 
-        self._kb_injected  = False
-        self._audio_paused = False  # True during KB injection to block stale audio chunks
-        self._ticket_raised = False
+        # Tool-use state (populated from incoming events)
+        self._tool_name:    str = ""
+        self._tool_use_id:  str = ""
+        self._tool_input:   str = ""  # accumulated JSON string
 
-        self._full_user_transcript = ""  # Persistent across the whole session
+        # Pending async tool tasks
+        self._pending_tool_tasks: dict[str, asyncio.Task] = {}
+        self._tool_processor = ToolProcessor()
+        self._tool_active = False
+
+        # Audio chunk queue — decouples receive loop from WebSocket send
+        self._audio_queue: asyncio.Queue = asyncio.Queue(maxsize=300)
+        self._audio_sender_task: asyncio.Task | None = None
 
     # ── Client ───────────────────────────────────────────────────────────────
 
@@ -133,6 +170,37 @@ class BedrockWebsocketManager:
     # ── Event builders ────────────────────────────────────────────────────────
 
     def _build_prompt_start(self):
+        """Build promptStart with toolConfiguration for KB search and ticketing."""
+        kb_search_schema = json.dumps({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query to look up in the knowledge base."
+                }
+            },
+            "required": ["query"]
+        })
+
+        raise_ticket_schema = json.dumps({
+            "type": "object",
+            "properties": {
+                "product_name": {
+                    "type": "string",
+                    "description": "The name of the product the user is having issues with."
+                },
+                "issue_description": {
+                    "type": "string",
+                    "description": "A detailed description of the user's issue."
+                },
+                "username": {
+                    "type": "string",
+                    "description": "The user's name or email address. Use 'Anonymous' if not provided."
+                }
+            },
+            "required": ["product_name", "issue_description", "username"]
+        })
+
         return json.dumps({
             "event": {
                 "promptStart": {
@@ -143,9 +211,38 @@ class BedrockWebsocketManager:
                         "sampleRateHertz": 24000,
                         "sampleSizeBits": 16,
                         "channelCount": 1,
-                        "voiceId": "matthew",
+                        "voiceId": "tiffany",
                         "encoding": "base64",
                         "audioType": "SPEECH"
+                    },
+                    "toolUseOutputConfiguration": {
+                        "mediaType": "application/json"
+                    },
+                    "toolConfiguration": {
+                        "tools": [
+                            {
+                                "toolSpec": {
+                                    "name": "searchKnowledgeBaseTool",
+                                    "description": (
+                                        "Retrieve official information or troubleshooting steps for our software products. "
+                                        "Call this tool whenever a user asks a general question about a product "
+                                        "or describes a specific technical problem."
+                                    ),
+                                    "inputSchema": {"json": kb_search_schema}
+                                }
+                            },
+                            {
+                                "toolSpec": {
+                                    "name": "raiseTicketTool",
+                                    "description": (
+                                        "Create a support ticket in the database for unresolved customer issues. "
+                                        "Call this tool only when the customer explicitly agrees to raise a ticket. "
+                                        "Collect relevant details (product, issue, username) first if not already known."
+                                    ),
+                                    "inputSchema": {"json": raise_ticket_schema}
+                                }
+                            }
+                        ]
                     }
                 }
             }
@@ -207,6 +304,35 @@ class BedrockWebsocketManager:
             }
         })
 
+    def _build_tool_content_start(self, content_name: str, tool_use_id: str):
+        return json.dumps({
+            "event": {
+                "contentStart": {
+                    "promptName": self.prompt_name,
+                    "contentName": content_name,
+                    "interactive": False,
+                    "type": "TOOL",
+                    "role": "USER",
+                    "toolResultInputConfiguration": {
+                        "toolUseId": tool_use_id,
+                        "type": "TEXT",
+                        "textInputConfiguration": {"mediaType": "text/plain"}
+                    }
+                }
+            }
+        })
+
+    def _build_tool_result(self, content_name: str, result: dict):
+        return json.dumps({
+            "event": {
+                "toolResult": {
+                    "promptName": self.prompt_name,
+                    "contentName": content_name,
+                    "content": json.dumps(result)
+                }
+            }
+        })
+
     # ── Stream lifecycle ──────────────────────────────────────────────────────
 
     async def initialize_stream(self):
@@ -217,7 +343,7 @@ class BedrockWebsocketManager:
                 InvokeModelWithBidirectionalStreamOperationInput(model_id=self.model_id)
             )
             self.is_active = True
-            
+
             # Fetch products dynamically from DB
             db = SessionLocal()
             try:
@@ -228,19 +354,18 @@ class BedrockWebsocketManager:
                 self.available_products = []
             finally:
                 db.close()
-                
+
             product_list_str = ", ".join(self.available_products) if self.available_products else "our software products"
 
             system_prompt = (
-                f"You are Nova Sonnet, a professional AI customer support agent for the following products: {product_list_str}. "
-                "Keep your responses extremely short and concise (1-2 sentences maximum). "
-                "Start by greeting the user and asking 'How can I help you today?'. "
-                "Listen carefully for the product name and problem they describe. "
-                "CRITICAL: If the product is not in the list of products above, firmly state that we only support those products and do not assist further. "
-                "When knowledge base information is injected into this conversation, use it to help the user. "
-                "If the issue remains unresolved for a supported product, offer to raise a support ticket. "
-                "Ask if they want to provide their name and email (tell them this is optional). "
-                "Once they answer, confirm the ticket has been created and close the conversation warmly."
+                f"You are Nova Sonnet, a professional AI customer support agent for: {product_list_str}. "
+                "Keep responses extremely short (2 sentences max). "
+                "Start by greeting user and asking 'How can I help you?'. "
+                "CRITICAL: If a product is mentioned that is NOT in the list above, inform the user we don't support it. "
+                "Whenever a user asks about a supported product or describes a problem, you MUST call 'searchKnowledgeBaseTool'. "
+                "Do not answer based on general knowledge for product-specific details. "
+                "If searching KB doesn't resolve the issue, offer to raise a ticket via 'raiseTicketTool'. "
+                "Confirm ticket creation verbally once done."
             )
 
             for evt in [
@@ -254,6 +379,8 @@ class BedrockWebsocketManager:
                 await self.send_raw_event(evt)
                 await asyncio.sleep(0.05)
 
+            # Start decoupled audio sender and response reader
+            self._audio_sender_task = asyncio.create_task(self._audio_sender_loop())
             self.response_task = asyncio.create_task(self._process_responses())
             debug_print("Bedrock stream connected successfully")
             return True
@@ -275,8 +402,8 @@ class BedrockWebsocketManager:
             debug_print(f"AWS Send Error: {e}")
 
     async def process_incoming_audio(self, audio_bytes: bytes):
-        if not self.is_active or self._audio_paused:
-            return  # drop audio during KB injection (avoids stale content name)
+        if not self.is_active or self._tool_active:
+            return
         try:
             b64 = base64.b64encode(audio_bytes).decode('utf-8')
             await self.send_raw_event(json.dumps({
@@ -291,157 +418,116 @@ class BedrockWebsocketManager:
         except Exception as e:
             debug_print(f"Audio Pump Error: {e}")
 
-    # ── Hybrid KB & Ticket injection ──────────────────────────────────────────
+    # ── Dedicated audio sender loop ───────────────────────────────────────────
 
-    def _is_issue_query(self, text: str) -> bool:
-        keywords = [
-            "issue", "problem", "error", "bug", "fix", "debug", "not working",
-            "doesn't work", "crash", "fail", "broken", "help", "troubleshoot",
-            "ticket", "raise", "can't", "cannot", "unable"
-        ]
-        lower = text.lower()
-        return any(kw in lower for kw in keywords)
+    async def _audio_sender_loop(self):
+        """Drains the audio queue and sends to WebSocket to prevent stalls."""
+        while self.is_active or not self._audio_queue.empty():
+            try:
+                audio_bytes = await asyncio.wait_for(
+                    self._audio_queue.get(), timeout=0.5
+                )
+                await self.websocket.send_bytes(audio_bytes)
+                self._audio_queue.task_done()
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                debug_print(f"Audio sender error: {type(e).__name__}: {e}")
+                break
 
-    async def _inject_kb_context(self, query: str):
-        """
-        Hybrid Approach 3: 
-        1. Close the open audio content block (required by Nova 2 Sonic).
-        2. Inject KB context as a new SYSTEM text turn.
-        3. Reopen a fresh audio content block so the user can continue speaking.
+    # ── Tool Handling ─────────────────────────────────────────────────────────
 
-        Nova 2 Sonic raises InvalidEventBytes if you open a new content block
-        while the audio block is still active.
-        """
-        debug_print(f"KB inject start: {query[:80]}")
-
-        kb_text = await asyncio.get_event_loop().run_in_executor(
-            None, query_knowledge_base, query
+    def handle_tool_request(self, tool_name: str, tool_input: dict, tool_use_id: str):
+        """Kick off async tool execution — non-blocking."""
+        content_name = str(uuid.uuid4())
+        task = asyncio.create_task(
+            self._execute_tool_and_send_result(tool_name, tool_input, tool_use_id, content_name)
         )
-        if not kb_text:
-            debug_print("KB returned nothing useful")
-            return
+        self._pending_tool_tasks[content_name] = task
+        task.add_done_callback(lambda t: self._pending_tool_tasks.pop(content_name, None))
 
-        if not self.is_active:
-            return
-
-        self._audio_paused = True  # pause audio pump to avoid stale content name
-        inject_cn = str(uuid.uuid4())
-        context_msg = (
-            f"[Knowledge Base context for this conversation]\n{kb_text}\n"
-            f"[Use the above to answer the user. If this doesn't resolve their issue, "
-            f"ask for their name/email and tell them a support ticket will be raised.]"
-        )
-
-        # 1. Close the currently-open audio content block
-        await self.send_raw_event(self._build_content_end(self.audio_content_name))
-        await asyncio.sleep(0.1)
-
-        # 2. Inject KB context as an ASSISTANT turn.
-        # Nova 2 Sonic only allows ONE SYSTEM block per prompt — the system prompt is
-        # already sent at init. We inject KB findings as an ASSISTANT "internal note".
-        context_msg = (
-            f"I found the following relevant information in the knowledge base:\n\n"
-            f"{kb_text}\n\n"
-            f"I will use this to help the user. If it does not resolve their issue, "
-            f"I will ask for their name and email and offer to raise a support ticket."
-        )
-        await self.send_raw_event(self._build_text_content_start(inject_cn, "ASSISTANT"))
-        await self.send_raw_event(self._build_text_input(inject_cn, context_msg))
-        await self.send_raw_event(self._build_content_end(inject_cn))
-        await asyncio.sleep(0.1)
-
-        # 3. Reopen a fresh audio content block
-        self.audio_content_name = str(uuid.uuid4())
-        await self.send_raw_event(self._build_audio_content_start())
-        self._audio_paused = False  # resume audio pump with new content name
-
-        debug_print("KB context injected and audio stream reopened")
-
-    async def _check_and_raise_ticket(self):
-        """
-        Heuristic approach to raise a ticket without requiring Bedrock tool-use.
-        Parses the user buffer for an email address and context.
-        """
-        if self._ticket_raised:
-            return
-
-        user_history = self._full_user_transcript.lower()
-        
-        # Look for an email address
-        email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', user_history)
-        if not email_match:
-            # Sometimes users say "at gmail dot com"
-            email_match = re.search(r'[\w\.-]+\s+(?:at|@)\s+[\w\.-]+\s+(?:dot|\.)\s+\w+', user_history)
-            
-        username = email_match.group(0) if email_match else "Unknown User"
-        
-        username = email_match.group(0) if email_match else "Unknown User"
-        
-        # Try to guess product dynamically based on available_products
-        product = None
-        if self.available_products:
-            # 1. Exact or partial substring match of the whole product name (ignoring case)
-            for p in self.available_products:
-                if p.lower() in user_history:
-                    product = p
-                    break
-            
-            # 2. Heuristic word matching if strict substring doesn't work
-            if not product:
-                for p in self.available_products:
-                    # e.g., 'Nova HealthLens (AI Health Monitoring System)' -> words longer than 3 chars
-                    words = [w for w in re.findall(r'\w+', p.lower()) if len(w) > 3 
-                             and w not in ['system', 'platform', 'app', 'application', 'software', 'management', 'monitoring']]
-                    for w in words:
-                        if w in user_history:
-                            product = p
-                            break
-                    if product:
-                        break
-
-        if not product:
-            debug_print("No supported product detected. Skipping DB ticket creation.")
-            self._ticket_raised = True
-            return
-        # The issue is ONLY what the user said
-        user_only_history = ' '.join(self._user_text_buf).lower()
-        if len(user_only_history) == 0:
-            user_only_history = user_history # fallback
-            
-        issue = user_only_history[-500:] if len(user_only_history) > 500 else user_only_history
-        
-        self._ticket_raised = True
-        debug_print(f"Triggering background ticket creation for {username}")
-        
-        loop = asyncio.get_running_loop()
+    async def _execute_tool_and_send_result(
+        self, tool_name: str, tool_input: dict, tool_use_id: str, content_name: str
+    ):
+        """Execute tool, send result to Bedrock, and notify frontend."""
         try:
-            # Shield the ticket creation task so it finishes even if the stream closes
-            await asyncio.shield(loop.run_in_executor(
-                None, raise_ticket_in_db, product, issue, username
-            ))
-        except Exception as e:
-            debug_print(f"Executor failed to run ticket DB insert: {e}")
+            debug_print(f"Executing tool: {tool_name}")
+            self._tool_active = True
 
-    # ── Response processor ────────────────────────────────────────────────────
+            # Notify frontend that tool is running
+            await self._ws_send_json({"type": "tool_status", "tool": tool_name, "status": "running"})
+
+            result = await self._tool_processor.process_tool_async(tool_name, tool_input)
+
+            # Nova 2 Sonic requires closing the current block before starting a new one.
+            # 1. Close the previous audio input block
+            await self.send_raw_event(self._build_content_end(self.audio_content_name))
+            await asyncio.sleep(0.1)
+
+            # 2. Send tool result block
+            await self.send_raw_event(self._build_tool_content_start(content_name, tool_use_id))
+            await self.send_raw_event(self._build_tool_result(content_name, result))
+            await self.send_raw_event(self._build_content_end(content_name))
+            await asyncio.sleep(0.1)
+
+            # 3. Re-open audio input block for continued interaction
+            self.audio_content_name = str(uuid.uuid4())
+            await self.send_raw_event(self._build_audio_content_start())
+
+            debug_print(f"Tool complete: {tool_name}")
+            # Notify frontend that tool is done
+            await self._ws_send_json({"type": "tool_status", "tool": tool_name, "status": "done"})
+
+        except Exception as e:
+            debug_print(f"Tool error [{tool_name}]: {e}")
+            try:
+                # Attempt graceful error recovery
+                err_res = {"error": f"Tool failed: {str(e)}"}
+                await self.send_raw_event(self._build_content_end(self.audio_content_name))
+                await asyncio.sleep(0.05)
+                await self.send_raw_event(self._build_tool_content_start(content_name, tool_use_id))
+                await self.send_raw_event(self._build_tool_result(content_name, err_res))
+                await self.send_raw_event(self._build_content_end(content_name))
+                await asyncio.sleep(0.05)
+                self.audio_content_name = str(uuid.uuid4())
+                await self.send_raw_event(self._build_audio_content_start())
+                await self._ws_send_json({"type": "tool_status", "tool": tool_name, "status": "error"})
+            except:
+                pass
+        finally:
+            self._tool_active = False
+
+    # ── Response Processor ────────────────────────────────────────────────────
 
     async def _process_responses(self):
         try:
             while self.is_active:
-                output = await self.stream_response.await_output()
-                result = await output[1].receive()
+                try:
+                    output = await self.stream_response.await_output()
+                    result = await output[1].receive()
+                except (asyncio.CancelledError, Exception) as e:
+                    if self.is_active:
+                        debug_print(f"Reader receive error: {e}")
+                    break
+
                 if not (result.value and result.value.bytes_):
                     continue
+
                 data = result.value.bytes_.decode('utf-8')
                 try:
                     j = json.loads(data)
-                    if 'event' not in j:
-                        continue
+                    if 'event' not in j: continue
                     event = j['event']
 
+                    # Audio output -> enqueue for sender loop
                     if 'audioOutput' in event:
                         audio_bytes = base64.b64decode(event['audioOutput']['content'])
-                        await self.websocket.send_bytes(audio_bytes)
+                        try:
+                            self._audio_queue.put_nowait(audio_bytes)
+                        except asyncio.QueueFull:
+                            debug_print("Audio queue full - dropping chunk")
 
+                    # Text output -> buffer + send to browser
                     elif 'textOutput' in event:
                         txt  = event['textOutput']['content']
                         role = event['textOutput']['role']
@@ -449,61 +535,77 @@ class BedrockWebsocketManager:
 
                         if '{ "interrupted" : true }' in txt:
                             await self._flush_turn_to_db()
-                            await self.websocket.send_json({"type": "interrupt"})
+                            # Clear audio queue on interruption
+                            while not self._audio_queue.empty():
+                                try:
+                                    self._audio_queue.get_nowait()
+                                    self._audio_queue.task_done()
+                                except asyncio.QueueEmpty: break
+                            await self._ws_send_json({"type": "interrupt"})
                         else:
                             if self._current_role and self._current_role != role:
                                 if self._current_role == 'ASSISTANT':
                                     await self._flush_turn_to_db()
                             self._current_role = role
-                            if role == 'USER':
-                                self._user_text_buf.append(txt)
-                                self._full_user_transcript += " " + txt
-                                combined = self._full_user_transcript.strip().lower()
+                            
+                            # Handle cumulative vs delta text
+                            target_buf = self._user_text_buf if role == 'USER' else self._agent_text_buf
+                            current_full = "".join(target_buf)
+                            
+                            if txt.startswith(current_full) and len(txt) > len(current_full):
+                                # It's cumulative! Append only the new part.
+                                delta = txt[len(current_full):]
+                                target_buf.append(delta)
+                            elif not current_full.endswith(txt):
+                                # It's likely a delta or a fresh start.
+                                target_buf.append(txt)
 
-                                # Trigger KB injection once when issue is detected
-                                if not self._kb_injected and self._is_issue_query(combined) and len(combined) > 40:
-                                    self._kb_injected = True  # set sync to prevent double-inject race
-                                    asyncio.create_task(self._inject_kb_context(combined))
-                            else:
-                                self._agent_text_buf.append(txt)
-                                combined_agent = ' '.join(self._agent_text_buf).lower()
-                                combined_user = self._full_user_transcript.strip().lower()
-                                
-                                # Heuristically detect ticket creation: 
-                                # 1. Agent talks about resolving/ticket/reaching out.
-                                # 2. User has already provided an email address.
-                                if not self._ticket_raised:
-                                    # Email is optional now, focus heavily on the agent confirming creation
-                                    # We just check if the agent mentions "ticket" and a creation verb anywhere in its response.
-                                    has_ticket_word = "ticket" in combined_agent
-                                    has_creation_verb = any(word in combined_agent for word in ["created", "raised", "logged", "opened"])
-                                    agent_confirming = has_ticket_word and has_creation_verb
-                                    
-                                    # Debug log every time the agent speaks to see what we're evaluating
-                                    if len(combined_agent) > 10:
-                                        debug_print(f"[Heuristic Check] agent_confirming: {agent_confirming}, user_len: {len(combined_user)}")
-                                    
-                                    if agent_confirming and len(combined_user) > 30:
-                                        asyncio.create_task(self._check_and_raise_ticket())
-                                        
-                            await self.websocket.send_json({"type": "text", "role": role, "content": txt})
+                            await self._ws_send_json({"type": "text", "role": role, "content": "".join(target_buf)})
+
+                    # toolUse -> accumulate info
+                    elif 'toolUse' in event:
+                        tu = event['toolUse']
+                        self._tool_name   = tu.get('toolName', '')
+                        self._tool_use_id = tu.get('toolUseId', '')
+                        self._tool_input  = tu.get('content', '{}')
+
+                    # contentEnd -> check for TOOL
+                    elif 'contentEnd' in event:
+                        ce = event['contentEnd']
+                        if ce.get('type') == 'TOOL':
+                            try:
+                                t_input = json.loads(self._tool_input) if self._tool_input else {}
+                            except: t_input = {}
+                            self.handle_tool_request(self._tool_name, t_input, self._tool_use_id)
+                            # Reset tool state
+                            self._tool_name = ""; self._tool_use_id = ""; self._tool_input = ""
+
+                    elif 'completionEnd' in event:
+                        await self._flush_turn_to_db()
+
+                    elif 'contentStart' in event:
+                        self._current_role = event['contentStart'].get('role')
 
                 except json.JSONDecodeError:
-                    debug_print(f"JSON decode error: {data[:80]}")
+                    pass
 
         except Exception as e:
             err = str(e)
-            ignored = ("ValidationException", "Stream closed", "CANCELLED", "InvalidStateError")
+            ignored = ("ValidationException", "Stream closed", "CANCELLED", "InvalidStateError", "StopAsyncIteration")
             if not any(x in err for x in ignored):
                 debug_print(f"AWS Read Error: {type(e).__name__}: {err}")
         finally:
             self.is_active = False
             try:
                 await self.websocket.close(code=1000)
-            except Exception:
-                pass
+            except: pass
 
-    # ── DB logging ────────────────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    async def _ws_send_json(self, payload: dict):
+        try:
+            await self.websocket.send_json(payload)
+        except: pass
 
     async def _flush_turn_to_db(self):
         user_text  = ' '.join(self._user_text_buf).strip()
@@ -544,17 +646,28 @@ class BedrockWebsocketManager:
             return
         self.is_active = False
 
+        # Cancel pending tool tasks
+        if hasattr(self, '_pending_tool_tasks'):
+            for task in list(self._pending_tool_tasks.values()):
+                task.cancel()
+
         await self._flush_turn_to_db()
 
-        # Wait for the reader task to fully stop before closing the stream
-        if self.response_task and not self.response_task.done():
-            self.response_task.cancel()
+        # Wait gracefully for reader task
+        res_task = self.response_task
+        if res_task and not res_task.done():
             try:
-                await asyncio.wait_for(asyncio.shield(self.response_task), timeout=2.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                pass
+                await asyncio.wait_for(asyncio.shield(res_task), timeout=0.5)
+            except:
+                if not res_task.done():
+                    res_task.cancel()
 
-        # Send graceful termination events directly (bypassing send_raw_event is_active guard)
+        # Wait for audio sender loop
+        sender_task = self._audio_sender_task
+        if sender_task and not sender_task.done():
+            sender_task.cancel()
+
+        # Send graceful termination events directly
         if self.stream_response:
             for evt in [
                 self._build_content_end(self.audio_content_name),
@@ -566,9 +679,9 @@ class BedrockWebsocketManager:
                         value=BidirectionalInputPayloadPart(bytes_=evt.encode('utf-8'))
                     )
                     await self.stream_response.input_stream.send(chunk)
-                except Exception:
+                except:
                     pass
             try:
                 await self.stream_response.input_stream.close()
-            except Exception as e:
-                debug_print(f"Stream close: {type(e).__name__}")
+            except:
+                pass

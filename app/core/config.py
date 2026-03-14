@@ -7,7 +7,7 @@ load_dotenv()
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 BEDROCK_MODEL_ID = os.getenv(
     "BEDROCK_MODEL_ID",
-    "us.amazon.nova-2-lite-v1:0"
+    "global.amazon.nova-2-lite-v1:0"
 )
 AWS_S3_BUCKET = os.getenv("AWS_S3_BUCKET", "")
 
