@@ -4,6 +4,4 @@ __pycache__/
 venv/
 .env
 .git/
-chroma_db/
-db/
 *.log

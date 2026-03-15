@@ -129,7 +129,7 @@ def chat_with_agent(user_query: str, session_history: List[Dict[str, str]] = Non
         
         system_prompt = (
             "You are Nova Sonnet, a highly capable AI assistant integrated into a video surveillance and ERP application. "
-            "Your job is to assist the user by answering their queries thoughtfully and accurately. "
+            "I can assist you with the knowledge graph and the tickets and tickets rising. Please feel free to reach out. "
             "Keep your responses relatively concise but helpful, as this may be spoken via Text-to-Speech."
         )
 

@@ -94,6 +94,7 @@ class AgentState(TypedDict):
     qualified_urls_map: dict[str, list[str]]
     raw_research_logs: list[dict] # {url: ..., raw_result: ...}
     log_queue: object
+    fast_mode: bool # New flag for speed optimization
 
 def planner_node(state: AgentState) -> AgentState:
     """Converts the startup idea into a competitor search query."""
@@ -112,16 +113,17 @@ def planner_node(state: AgentState) -> AgentState:
     
     _log_to_db(db_session_id, "planner", f"Optimized search query: '{search_query}'", queue)
     state["search_query"] = search_query
+    state["fast_mode"] = True # Default to fast mode
     return state
 
 def executor_node(state: AgentState) -> AgentState:
-    """Uses Tavily API to search Google for competitors."""
+    """Uses Tavily API to search Google for competitors with content extraction."""
     import httpx
     query = state["search_query"]
     queue = state.get("log_queue")
     db_session_id = state["db_session_id"]
     
-    _log_to_db(db_session_id, "executor", f"Calling Tavily to find competitors...", queue)
+    _log_to_db(db_session_id, "executor", f"Calling Tavily (FAST) to find competitors and extract content...", queue)
     
     tavily_key = os.environ.get("TAVILY_API_KEY")
     if not tavily_key:
@@ -130,7 +132,6 @@ def executor_node(state: AgentState) -> AgentState:
         return state
         
     try:
-        # Wrap the connection in a retry loop to mitigate intermittent DNS/getaddrinfo issues
         import time
         max_retries = 3
         data = None
@@ -143,7 +144,8 @@ def executor_node(state: AgentState) -> AgentState:
                         json={
                             "api_key": tavily_key,
                             "query": query,
-                            "search_depth": "basic",
+                            "search_depth": "advanced", # Advanced for better content
+                            "include_content": True,     # GET CONTENT DIRECTLY
                             "max_results": 4
                         }
                     )
@@ -155,9 +157,21 @@ def executor_node(state: AgentState) -> AgentState:
                         raise e
                     time.sleep(2 ** attempt)
         
-        urls = [r.get('url') for r in data.get("results", []) if r.get('url')]
+        results = data.get("results", [])
+        urls = []
+        for r in results:
+            url = r.get('url')
+            content = r.get('content')
+            if url:
+                urls.append(url)
+                if content:
+                    # Store the extracted content directly into raw_research_logs
+                    state["raw_research_logs"].append({
+                        "url": url,
+                        "raw_result": f"Content extracted from Tavily Search:\n{content}"
+                    })
         
-        _log_to_db(db_session_id, "executor", f"Tavily found {len(urls)} potential competitors.", queue)
+        _log_to_db(db_session_id, "executor", f"Tavily returned {len(urls)} competitors with instant content.", queue)
         state["competitor_urls"] = urls
     except Exception as e:
         _log_to_db(db_session_id, "executor", f"Tavily Error: {str(e)}", queue)
@@ -166,7 +180,7 @@ def executor_node(state: AgentState) -> AgentState:
     return state
 
 def filter_node(state: AgentState) -> AgentState:
-    """Filters out irrelevant URLs (like wikipedia, generic news) before scraping to save time."""
+    """Filters out irrelevant URLs and decides if we can skip deep scraping."""
     urls = state.get("competitor_urls", [])
     queue = state.get("log_queue")
     db_session_id = state["db_session_id"]
@@ -182,11 +196,23 @@ def filter_node(state: AgentState) -> AgentState:
         else:
             filtered_urls.append(u)
             
-    state["competitor_urls"] = filtered_urls[:4] # Enforce max 4 valid urls
+    state["competitor_urls"] = filtered_urls[:4]
+    
+    # If we already have content for these URLs, we can set fast_mode = True to jump to extraction
+    has_logs = {log["url"] for log in state["raw_research_logs"]}
+    if all(u in has_logs for u in state["competitor_urls"]) and state["competitor_urls"]:
+        _log_to_db(db_session_id, "system", "Content available via quick search. Skipping deep browse.", queue)
+        state["fast_mode"] = True
+    else:
+        state["fast_mode"] = False # Need deep scraping if content is missing
+        
     return state
 
 def discovery_node(state: AgentState) -> AgentState:
     """Uses Nova Act to visit the homepage and explicitly extract all internal links."""
+    if state.get("fast_mode"):
+        return state # Skip in fast mode
+
     urls = state.get("competitor_urls", [])
     queue = state.get("log_queue")
     db_session_id = state["db_session_id"]
@@ -211,17 +237,14 @@ def discovery_node(state: AgentState) -> AgentState:
             @workflow(workflow_definition_name="AutonomousMarketResearchAgent", model_id="nova-act-latest", boto_session_kwargs=boto_config)
             def _get_links():
                 with NovaAct(starting_page=url, headless=True) as nova:
-                    # Explicitly ask Nova Act to find links
                     instruction = "Find and return all unique internal URLs on this page that lead to pricing, features, about, or product details. Return them as a comma-separated list."
                     res = nova.act(instruction)
                     return str(res)
             
             links_raw = _get_links()
-            # Basic cleanup of Nova's response
             links_list = [l.strip() for l in links_raw.split(',') if l.strip().startswith('http')]
             
             if not links_list:
-                # Fallback to BeautifulSoup if Nova Act didn't find clear URLs
                 import httpx
                 from bs4 import BeautifulSoup
                 from urllib.parse import urljoin, urlparse
@@ -266,6 +289,9 @@ def discovery_node(state: AgentState) -> AgentState:
 
 def nova_scraper_node(state: AgentState) -> AgentState:
     """Uses Nova Act to visit the qualified URLs and extract text."""
+    if state.get("fast_mode"):
+        return state # Skip in fast mode
+
     qualified_map = state.get("qualified_urls_map", {})
     queue = state.get("log_queue")
     db_session_id = state["db_session_id"]
@@ -294,7 +320,7 @@ def nova_scraper_node(state: AgentState) -> AgentState:
             
             try:
                 page_text = _scrape_page()
-                combined_text += f"\\n\\n--- Content from {url} ---\\n{page_text}"
+                combined_text += f"\n\n--- Content from {url} ---\n{page_text}"
             except Exception as e:
                 _log_to_db(db_session_id, "critic", f"Failed to scrape {url} with Nova Act. Error: {e}", queue)
                 
@@ -307,37 +333,33 @@ def nova_scraper_node(state: AgentState) -> AgentState:
     return state
 
 def extractor_node(state: AgentState) -> AgentState:
-    """Takes the noisy Nova Act logs and distills only the website intelligence into JSON."""
+    """Takes the raw content and distills only the website intelligence into JSON."""
     logs = state.get("raw_research_logs", [])
     queue = state.get("log_queue")
     db_session_id = state["db_session_id"]
     goal = state["goal"]
 
-    _log_to_db(db_session_id, "critic", "Extracting rich insights from raw website text...", queue)
+    _log_to_db(db_session_id, "critic", "Distilling rich insights from gathered content...", queue)
 
     for item in logs:
         url = item["url"]
         raw_text = item["raw_result"]
 
         prompt = f"""
-        You are a data extractor. You have received the raw HTML text from a competitor's website.
-        Extract the most valuable business information regarding this product.
+        You are a data extractor. Extract business intelligence from the following content regarding this product.
         
-        Instead of a fixed schema, generate dynamic Key-Value pairs that best represent what this specific website offers.
-        For example, if they emphasize "Security", create a "Security" key. 
-        Ensure you ALWAYS include a "Pricing" key, a "Key Capabilities" key, and an "Idea Relevance" key comparing them to the user's idea: '{goal}'.
+        Research Goal: '{goal}'.
+        
+        Generate dynamic Key-Value pairs. 
+        Ensure you ALWAYS include:
+        - "Pricing": Detailed pricing or 'Contact for pricing' if not found.
+        - "Key Capabilities": Bullet points of main features.
+        - "Idea Relevance": Comparison to the user's idea.
 
-        Return ONLY a raw, flat JSON dictionary. No nested objects inside the dictionary, just string values.
-        Example format: 
-        {{
-            "Pricing": "Starts at $10/mo...",
-            "Key Capabilities": "- Feature 1\\n- Feature 2",
-            "Idea Relevance": "Highly relevant...",
-            "Deployment Options": "Cloud and On-Prem"
-        }}
-
-        Website Text:
-        {raw_text}
+        Return ONLY a raw, flat JSON dictionary. No markdown, no pre-text.
+        
+        Content:
+        {raw_text[:15000]}
         """
 
         try:
@@ -349,10 +371,10 @@ def extractor_node(state: AgentState) -> AgentState:
                 
             parsed = json.loads(json_output.strip())
             _save_result(db_session_id, url, parsed)
-            _log_to_db(db_session_id, "critic", f"Structured dynamic intelligence for {url}", queue)
+            _log_to_db(db_session_id, "critic", f"Structured intelligence for {url}", queue)
         except Exception as e:
-            _log_to_db(db_session_id, "critic", f"Failed to structure data for {url}. Saving raw.", queue)
-            _save_result(db_session_id, url, {"Error": "Parsing Failed", "Raw Data Extract": raw_text[:500] + "..."})
+            _log_to_db(db_session_id, "critic", f"Failed to structure data for {url}. Saving raw snippet.", queue)
+            _save_result(db_session_id, url, {"Error": "Extraction Failed", "Raw Data Snippet": raw_text[:500] + "..."})
 
     return state
 
@@ -382,7 +404,7 @@ _GRAPH = _build_graph()
 def run_market_agent(db_session_id: int, goal: str, queue: asyncio.Queue | None = None):
     try:
         _mark_session(db_session_id, "running")
-        _log_to_db(db_session_id, "system", f"Starting Market Research Pipeline: '{goal}'", queue)
+        _log_to_db(db_session_id, "system", f"Starting Nova Quick Search: '{goal}'", queue)
 
         initial_state: AgentState = {
             "db_session_id": db_session_id,
@@ -391,7 +413,8 @@ def run_market_agent(db_session_id: int, goal: str, queue: asyncio.Queue | None 
             "competitor_urls": [],
             "qualified_urls_map": {},
             "raw_research_logs": [],
-            "log_queue": queue
+            "log_queue": queue,
+            "fast_mode": True
         }
         _GRAPH.invoke(initial_state)
         
